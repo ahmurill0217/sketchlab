@@ -1,0 +1,33 @@
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Test outputs
+test_output/
+test_image.png
+test_sample.png
+
+# Environment
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Model cache
+.cache/
+models/
+
+# Misc
+*.log
+.DS_Store
