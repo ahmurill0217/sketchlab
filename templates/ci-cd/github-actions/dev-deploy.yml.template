@@ -1,0 +1,339 @@
+name: PR Development Deployment
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+env:
+  IMAGE_REGISTRY: "${AZURE_REGISTRY}.azurecr.io/${PROJECT_NAME}"
+  RESOURCE_GROUP: "${RESOURCE_GROUP}"
+  LOCATION: "${AZURE_LOCATION}"
+  PR_NUMBER: ${{ github.event.pull_request.number }}
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  generate-tags:
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.generate.outputs.tag }}
+      client-image: ${{ steps.generate.outputs.client-image }}
+      admin-image: ${{ steps.generate.outputs.admin-image }}
+      api-image: ${{ steps.generate.outputs.api-image }}
+    steps:
+      - name: Generate image tags
+        id: generate
+        run: |
+          SHORT_SHA=${GITHUB_SHA:0:7}
+          TAG="pr-${{ env.PR_NUMBER }}-${SHORT_SHA}"
+
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "client-image=${{ env.IMAGE_REGISTRY }}/client:${TAG}" >> $GITHUB_OUTPUT
+          echo "admin-image=${{ env.IMAGE_REGISTRY }}/admin:${TAG}" >> $GITHUB_OUTPUT
+          echo "api-image=${{ env.IMAGE_REGISTRY }}/api:${TAG}" >> $GITHUB_OUTPUT
+
+          echo "Generated tag: ${TAG}"
+
+  build-images:
+    needs: generate-tags
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        include:
+          - service: client
+            context: ./services/client
+            image: ${{ needs.generate-tags.outputs.client-image }}
+          - service: admin
+            context: ./services/admin
+            image: ${{ needs.generate-tags.outputs.admin-image }}
+          - service: api
+            context: ./services/api
+            image: ${{ needs.generate-tags.outputs.api-image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${AZURE_REGISTRY}.azurecr.io
+          username: ${{ secrets.AZURE_CLIENT_ID }}
+          password: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+      - name: Build and push ${{ matrix.service }} image
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.context }}
+          push: true
+          tags: ${{ matrix.image }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  create-environment:
+    needs: [generate-tags, build-images]
+    runs-on: ubuntu-22.04
+    outputs:
+      environment-name: ${{ steps.set-names.outputs.environment-name }}
+      client-app-name: ${{ steps.set-names.outputs.client-app-name }}
+      admin-app-name: ${{ steps.set-names.outputs.admin-app-name }}
+      api-app-name: ${{ steps.set-names.outputs.api-app-name }}
+      postgres-app-name: ${{ steps.set-names.outputs.postgres-app-name }}
+      client-url: ${{ steps.get-urls.outputs.client-url }}
+      admin-url: ${{ steps.get-urls.outputs.admin-url }}
+      api-url: ${{ steps.get-urls.outputs.api-url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set resource names
+        id: set-names
+        run: |
+          echo "environment-name=env-${PROJECT_NAME}-pr-${{ env.PR_NUMBER }}" >> $GITHUB_OUTPUT
+          echo "client-app-name=app-${PROJECT_NAME}-client-pr-${{ env.PR_NUMBER }}" >> $GITHUB_OUTPUT
+          echo "admin-app-name=app-${PROJECT_NAME}-admin-pr-${{ env.PR_NUMBER }}" >> $GITHUB_OUTPUT
+          echo "api-app-name=app-${PROJECT_NAME}-api-pr-${{ env.PR_NUMBER }}" >> $GITHUB_OUTPUT
+          echo "postgres-app-name=app-${PROJECT_NAME}-db-pr-${{ env.PR_NUMBER }}" >> $GITHUB_OUTPUT
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Create Container App Environment
+        run: |
+          # Check if environment exists
+          ENV_EXISTS=$(az containerapp env list \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "[?name=='${{ steps.set-names.outputs.environment-name }}'].name" \
+            -o tsv)
+
+          if [ -z "$ENV_EXISTS" ]; then
+            echo "Creating new Container App Environment..."
+            az containerapp env create \
+              --name ${{ steps.set-names.outputs.environment-name }} \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --location ${{ env.LOCATION }} \
+              --logs-workspace-id ${{ secrets.LOG_ANALYTICS_WORKSPACE_ID }} \
+              --logs-workspace-key ${{ secrets.LOG_ANALYTICS_WORKSPACE_KEY }}
+          else
+            echo "Container App Environment already exists"
+          fi
+
+      # PostgreSQL Container App removed - using shared Azure Database for PostgreSQL instead
+
+      - name: Deploy API Container App
+        run: |
+          # Use shared Azure Database for PostgreSQL with project-specific schema
+          DB_HOST="${POSTGRES_SERVER_DEV}.postgres.database.azure.com"
+
+          # URL encode the password to handle special characters
+          DB_PASSWORD_ENCODED=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${{ secrets.DB_PASSWORD }}', safe=''))")
+          # Connect to shared devdb with project-specific schema
+          DATABASE_URL="postgresql://postgres:${DB_PASSWORD_ENCODED}@${DB_HOST}:5432/devdb?sslmode=require&options=-csearch_path%3D${DATABASE_NAME}"
+
+          # Create or update Container App using CLI flags to avoid YAML parsing issues
+          set -e
+          az containerapp create \
+            --name ${{ steps.set-names.outputs.api-app-name }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --environment ${{ steps.set-names.outputs.environment-name }} \
+            --image "${{ needs.generate-tags.outputs.api-image }}" \
+            --ingress external \
+            --target-port 8000 \
+            --cpu 0.5 \
+            --memory 1.0Gi \
+            --min-replicas 1 \
+            --max-replicas 3 \
+            --registry-server ${AZURE_REGISTRY}.azurecr.io \
+            --registry-username "${{ secrets.AZURE_CLIENT_ID }}" \
+            --registry-password "${{ secrets.AZURE_CLIENT_SECRET }}" \
+            --secrets \
+              registry-password="${{ secrets.AZURE_CLIENT_SECRET }}" \
+            --env-vars \
+              app_name="${APP_NAME}" \
+              DATABASE_URL="${DATABASE_URL}" \
+              ENVIRONMENT="development" \
+          || \
+          az containerapp update \
+            --name ${{ steps.set-names.outputs.api-app-name }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image "${{ needs.generate-tags.outputs.api-image }}" \
+            --set-env-vars \
+              app_name="${APP_NAME}" \
+              DATABASE_URL="${DATABASE_URL}" \
+              ENVIRONMENT="development"
+
+      - name: Deploy Client Container App
+        run: |
+          # Get external API URL for client-side requests
+          API_FQDN=$(az containerapp show \
+            --name ${{ steps.set-names.outputs.api-app-name }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+
+          API_URL="https://${API_FQDN}"
+
+          # Create or update client app using CLI flags (avoid YAML parsing issues)
+          set -e
+          az containerapp create \
+            --name ${{ steps.set-names.outputs.client-app-name }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --environment ${{ steps.set-names.outputs.environment-name }} \
+            --image "${{ needs.generate-tags.outputs.client-image }}" \
+            --ingress external \
+            --target-port 3000 \
+            --cpu 0.5 \
+            --memory 1.0Gi \
+            --min-replicas 1 \
+            --max-replicas 3 \
+            --registry-server ${AZURE_REGISTRY}.azurecr.io \
+            --registry-username "${{ secrets.AZURE_CLIENT_ID }}" \
+            --registry-password "${{ secrets.AZURE_CLIENT_SECRET }}" \
+            --env-vars \
+              NEXT_PUBLIC_API="${API_URL}" \
+          || \
+          az containerapp update \
+            --name ${{ steps.set-names.outputs.client-app-name }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image "${{ needs.generate-tags.outputs.client-image }}" \
+            --set-env-vars \
+              NEXT_PUBLIC_API="${API_URL}"
+
+      - name: Deploy Admin Container App
+        run: |
+          # Get external API URL for client-side requests
+          API_FQDN=$(az containerapp show \
+            --name ${{ steps.set-names.outputs.api-app-name }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+
+          API_URL="https://${API_FQDN}"
+
+          # Create or update admin app using CLI flags (avoid YAML parsing issues)
+          set -e
+          az containerapp create \
+            --name ${{ steps.set-names.outputs.admin-app-name }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --environment ${{ steps.set-names.outputs.environment-name }} \
+            --image "${{ needs.generate-tags.outputs.admin-image }}" \
+            --ingress external \
+            --target-port 3001 \
+            --cpu 0.5 \
+            --memory 1.0Gi \
+            --min-replicas 1 \
+            --max-replicas 3 \
+            --registry-server ${AZURE_REGISTRY}.azurecr.io \
+            --registry-username "${{ secrets.AZURE_CLIENT_ID }}" \
+            --registry-password "${{ secrets.AZURE_CLIENT_SECRET }}" \
+            --env-vars \
+              NEXT_PUBLIC_API="${API_URL}" \
+          || \
+          az containerapp update \
+            --name ${{ steps.set-names.outputs.admin-app-name }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image "${{ needs.generate-tags.outputs.admin-image }}" \
+            --set-env-vars \
+              NEXT_PUBLIC_API="${API_URL}"
+
+      - name: Get deployment URLs
+        id: get-urls
+        run: |
+          CLIENT_URL=$(az containerapp show \
+            --name ${{ steps.set-names.outputs.client-app-name }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+
+          ADMIN_URL=$(az containerapp show \
+            --name ${{ steps.set-names.outputs.admin-app-name }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+
+          API_URL=$(az containerapp show \
+            --name ${{ steps.set-names.outputs.api-app-name }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+
+          echo "client-url=https://${CLIENT_URL}" >> $GITHUB_OUTPUT
+          echo "admin-url=https://${ADMIN_URL}" >> $GITHUB_OUTPUT
+          echo "api-url=https://${API_URL}" >> $GITHUB_OUTPUT
+
+  post-deployment-comment:
+    needs: create-environment
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Comment PR with deployment URLs
+        uses: actions/github-script@v7
+        env:
+          CLIENT_URL: ${{ needs.create-environment.outputs.client-url }}
+          ADMIN_URL: ${{ needs.create-environment.outputs.admin-url }}
+          ENVIRONMENT_NAME: ${{ needs.create-environment.outputs.environment-name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const comment = `### 🚀 PR Environment Deployed!
+
+            Your PR environment has been successfully deployed. You can access the applications at:
+
+            - **Client Application**: ${process.env.CLIENT_URL}
+            - **Admin Dashboard**: ${process.env.ADMIN_URL}
+
+
+            **Environment Details:**
+            - Environment: \`${process.env.ENVIRONMENT_NAME}\`
+            - PR Number: #${process.env.PR_NUMBER}
+            - Commit: \`${context.sha.substring(0, 7)}\`
+
+            This environment will be automatically cleaned up when the PR is closed or merged.`;
+
+            // Find and update existing comment or create new one
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(comment =>
+              comment.user.type === 'Bot' &&
+              comment.body.includes('PR Environment Deployed')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: comment
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment
+              });
+            }

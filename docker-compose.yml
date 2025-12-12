@@ -1,0 +1,61 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: sketchlab-postgres
+    ports:
+      - ${PG_PORT:-5432}:5432
+    environment:
+      POSTGRES_DB: sketchlab
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: securepassword
+    healthcheck:
+      test: "pg_isready -h localhost -U postgres -d sketchlab"
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    labels:
+      - "project=sketchlab"
+
+  api:
+    container_name: sketchlab-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    build:
+      context: ./services/api/
+    ports:
+      - ${API_PORT:-8000}:8000
+    volumes:
+      - ./services/api/app:/code/app
+    env_file:
+      - services/api/.env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    labels:
+      - "project=sketchlab"
+
+  client:
+    container_name: sketchlab-client
+    build:
+      context: ./services/client/
+      target: local
+    ports:
+      - ${CLIENT_PORT:-3000}:3000
+    volumes:
+      - ./services/client/:/usr/src/app
+      - /usr/src/app/node_modules
+    environment:
+      - NEXT_TELEMETRY_DISABLED=1
+    env_file:
+      - services/client/.env
+    labels:
+      - "project=sketchlab"
+
+volumes:
+  db-data:
+    labels:
+      - "project=sketchlab"

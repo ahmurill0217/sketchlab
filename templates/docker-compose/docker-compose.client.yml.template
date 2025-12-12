@@ -1,0 +1,19 @@
+version: "3.9"
+
+services:
+  client:
+    container_name: ${PROJECT_NAME}-client
+    build:
+      context: ./services/client/
+      target: local
+    ports:
+      - ${CLIENT_PORT:-3000}:3000
+    volumes:
+      - ./services/client/:/usr/src/app
+      - /usr/src/app/node_modules
+    environment:
+      - NEXT_TELEMETRY_DISABLED=1
+    env_file:
+      - services/client/.env
+    labels:
+      - "project=${PROJECT_NAME}"

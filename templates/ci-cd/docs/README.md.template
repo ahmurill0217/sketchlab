@@ -1,0 +1,148 @@
+# ${PROJECT_NAME} - CI/CD Documentation
+
+This repository uses automated CI/CD pipelines for deploying to Azure Container Apps.
+
+## Architecture Overview
+
+This project is configured for automated deployment with the following components:
+- Container-based services deployed to Azure Container Apps
+- PostgreSQL database for data persistence (when applicable)
+- Multi-environment setup (development, staging, production)
+
+## Deployment Environments
+
+### Development (PR Environments)
+- **Trigger**: Pull requests to staging branch
+- **Lifecycle**: Created on PR open, updated on commits, deleted on PR close
+- **Purpose**: Testing and review
+- **URL Pattern**: `https://app-${PROJECT_NAME}-client-pr-{number}.${AZURE_LOCATION}.azurecontainerapps.io`
+
+### Staging
+- **Trigger**: Pushes to `staging` branch
+- **Purpose**: Pre-production testing and validation
+- **URL**: `https://app-${PROJECT_NAME}-client-stg.${AZURE_LOCATION}.azurecontainerapps.io`
+
+### Production  
+- **Trigger**: Git tags matching `v*.*.*` pattern
+- **Purpose**: Live application
+- **URL**: `https://app-${PROJECT_NAME}-client-prod.${AZURE_LOCATION}.azurecontainerapps.io`
+
+## Required GitHub Secrets
+
+Add these secrets to your GitHub repository settings:
+
+### Azure Authentication
+- `AZURE_CREDENTIALS`: Service principal JSON for authentication
+- `AZURE_CLIENT_ID`: Service principal client ID
+- `AZURE_CLIENT_SECRET`: Service principal client secret  
+- `AZURE_TENANT_ID`: Azure tenant ID
+
+### Database
+- `DB_PASSWORD`: PostgreSQL database password
+
+### Monitoring
+- `LOG_ANALYTICS_WORKSPACE_ID`: Log Analytics workspace ID
+- `LOG_ANALYTICS_WORKSPACE_KEY`: Log Analytics workspace key
+
+### Application Secrets (customize as needed)
+- `AZURE_OPENAI_API_KEY`: OpenAI API key (if using)
+- `AZURE_OPENAI_ENDPOINT`: OpenAI endpoint (if using)
+- `DOCS_URL`: Documentation URL (if applicable)
+- `EMAIL_FROM_ADDRESS`: Email sender address (if using email)
+
+## Deployment Process
+
+### 1. Development Workflow
+1. Create feature branch
+2. Make changes and push commits
+3. Open pull request to `staging` → triggers dev environment deployment
+4. Review and test in PR environment
+5. Merge to `staging` when approved
+
+### 2. Staging Deployment
+1. Push directly to `staging` branch OR merge PR to `staging`
+2. Push triggers staging deployment automatically
+3. Validation and testing in staging environment
+
+### 3. Production Release
+1. Create and push version tag: `git tag v1.0.0 && git push origin v1.0.0`
+2. Tag triggers production deployment
+3. Manual approval required in GitHub Actions
+
+## Azure Resources
+
+The following Azure resources are created and managed:
+
+### Resource Group: `${RESOURCE_GROUP}`
+- Container Registry: `${AZURE_REGISTRY}.azurecr.io`
+- Container Apps Environments:
+  - `env-${PROJECT_NAME}-stg` (staging)
+  - `env-${PROJECT_NAME}-prod` (production)
+  - `env-${PROJECT_NAME}-pr-*` (dev/PR environments)
+
+### Container Apps
+- **Client**: `app-${PROJECT_NAME}-client-{env}`
+- **Admin**: `app-${PROJECT_NAME}-admin-{env}`  
+- **API**: `app-${PROJECT_NAME}-api-{env}`
+
+### Database Architecture
+
+#### Development Environment
+- **Shared Server**: `${POSTGRES_SERVER_DEV}` (shared across all projects)
+- **Database**: `devdb` (shared database)
+- **Schema**: `${DATABASE_NAME}` (project-specific schema)
+- **Benefit**: Cost-efficient, one dev server for all projects
+
+#### Staging & Production Environments  
+- **Dedicated Servers**: 
+  - Staging: `${POSTGRES_SERVER_STAGING}` (project-specific)
+  - Production: `${POSTGRES_SERVER_PROD}` (project-specific)
+- **Database**: `${DATABASE_NAME}` (isolated per project)
+- **Benefit**: Complete isolation for staging/production data
+
+## Monitoring and Logs
+
+- **Application Logs**: View in Azure Container Apps console
+- **Build Logs**: Check GitHub Actions workflow runs
+- **Infrastructure**: Monitor via Log Analytics workspace
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Build Failures**
+   - Check GitHub Actions logs
+   - Verify all secrets are configured
+   - Ensure Docker builds work locally
+
+2. **Deployment Failures**  
+   - Verify Azure permissions
+   - Check service principal credentials
+   - Ensure Azure resources exist
+
+3. **Database Connection Issues**
+   - Verify database server names
+   - Check firewall rules for Azure services
+   - Confirm database credentials
+
+### Support Commands
+
+```bash
+# Check detected services  
+make services
+```
+
+## Security Considerations
+
+- All secrets are managed via GitHub Secrets
+- Service principal has minimum required permissions
+- Database connections use SSL/TLS
+- Container images are scanned for vulnerabilities
+- PR environments are automatically cleaned up
+
+## Cost Optimization
+
+- PR environments use minimal resources (0.5 CPU, 1GB RAM)
+- Staging uses moderate resources for realistic testing
+- Production scales based on actual demand (2-10 replicas)
+- Unused PR environments are automatically deleted

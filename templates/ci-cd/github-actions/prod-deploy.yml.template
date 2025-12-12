@@ -1,0 +1,451 @@
+name: Production Deployment
+
+on:
+  push:
+    tags:
+      - "v*.*.*" # Semantic versioning tags only
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: "Version tag to deploy (e.g., v1.2.0)"
+        required: true
+        type: string
+
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  deployments: write
+
+env:
+  IMAGE_REGISTRY: "${AZURE_REGISTRY}.azurecr.io/${PROJECT_NAME}"
+  RESOURCE_GROUP: "${RESOURCE_GROUP}"
+  PROD_ENVIRONMENT: "env-${PROJECT_NAME}-prod"
+  CLIENT_APP_NAME: "app-${PROJECT_NAME}-client-prod"
+  ADMIN_APP_NAME: "app-${PROJECT_NAME}-admin-prod"
+  API_APP_NAME: "app-${PROJECT_NAME}-api-prod"
+  POSTGRES_APP_NAME: "app-${PROJECT_NAME}-db-prod"
+  STAGING_ENVIRONMENT: "env-${PROJECT_NAME}-stg"
+
+jobs:
+  validate-deployment:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+      proceed: ${{ steps.validation.outputs.proceed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get version tag
+        id: get-version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version_tag }}"
+          else
+            VERSION="${{ github.ref_name }}"
+          fi
+
+          # Validate semantic versioning format
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "L Invalid version format: $VERSION"
+            echo "Please use semantic versioning: v1.2.3"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Preparing to deploy version: $VERSION"
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Verify staging health
+        id: staging-health
+        run: |
+          echo "Checking staging environment health..."
+
+          # Check staging container apps are running
+          for app in "app-${PROJECT_NAME}-client-stg" "app-${PROJECT_NAME}-admin-stg" "app-${PROJECT_NAME}-api-stg"; do
+            STATE=$(az containerapp show \
+              --name $app \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --query "properties.runningStatus" -o tsv 2>/dev/null || echo "NotFound")
+
+            if [ "$STATE" != "Running" ]; then
+              echo "L Staging app $app is not running (status: $STATE)"
+              exit 1
+            fi
+            echo "$app is running"
+          done
+
+          # There currently is no health check endpoint for the API service,
+          # so we will skip the health check for now, but we should add
+          # one in the future as a best practice.
+          # Check staging API health endpoint
+          # STAGING_API_URL=$(az containerapp show \
+          #   --name "app-${PROJECT_NAME}-api-staging" \
+          #   --resource-group ${{ env.RESOURCE_GROUP }} \
+          #   --query "properties.configuration.ingress.fqdn" -o tsv)
+
+          # if curl -f -s "https://${STAGING_API_URL}/health" > /dev/null; then
+          #   echo "Staging API health check passed"
+          # else
+          #   echo "L Staging API health check failed"
+          #   exit 1
+          # fi
+
+      - name: Final validation
+        id: validation
+        run: |
+          echo "proceed=true" >> $GITHUB_OUTPUT
+          echo "All pre-deployment checks passed!"
+
+  promote-images:
+    needs: validate-deployment
+    if: needs.validate-deployment.outputs.proceed == 'true'
+    runs-on: ubuntu-22.04
+    environment: production # Requires manual approval
+    outputs:
+      client-image: ${{ steps.tag-images.outputs.client-image }}
+      admin-image: ${{ steps.tag-images.outputs.admin-image }}
+      api-image: ${{ steps.tag-images.outputs.api-image }}
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Tag staging images for production
+        id: tag-images
+        run: |
+          VERSION="${{ needs.validate-deployment.outputs.version }}"
+          echo "Tagging staging images as $VERSION..."
+
+          # Tag each staging-latest image with the version number
+          for repo in client admin api; do
+            echo "Tagging ${repo}:staging-latest as ${repo}:${VERSION}"
+
+            # Create version tag
+            az acr import \
+              --name ${AZURE_REGISTRY} \
+              --source "${AZURE_REGISTRY}.azurecr.io/${PROJECT_NAME}/${repo}:staging-latest" \
+              --image "${PROJECT_NAME}/${repo}:${VERSION}" \
+              --force
+
+            # Also update prod-latest tag
+            az acr import \
+              --name ${AZURE_REGISTRY} \
+              --source "${AZURE_REGISTRY}.azurecr.io/${PROJECT_NAME}/${repo}:staging-latest" \
+              --image "${PROJECT_NAME}/${repo}:prod-latest" \
+              --force
+          done
+
+          echo "client-image=${{ env.IMAGE_REGISTRY }}/client:${VERSION}" >> $GITHUB_OUTPUT
+          echo "admin-image=${{ env.IMAGE_REGISTRY }}/admin:${VERSION}" >> $GITHUB_OUTPUT
+          echo "api-image=${{ env.IMAGE_REGISTRY }}/api:${VERSION}" >> $GITHUB_OUTPUT
+
+          echo "Images tagged successfully"
+
+  deploy-to-production:
+    needs: [validate-deployment, promote-images]
+    runs-on: ubuntu-22.04
+    outputs:
+      client-url: ${{ steps.get-urls.outputs.client-url }}
+      admin-url: ${{ steps.get-urls.outputs.admin-url }}
+      api-url: ${{ steps.get-urls.outputs.api-url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Create deployment record
+        id: create-deployment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deployment = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: '${{ needs.validate-deployment.outputs.version }}',
+              environment: 'production',
+              required_contexts: [],
+              description: 'Production deployment of ${{ needs.validate-deployment.outputs.version }}'
+            });
+
+            core.setOutput('deployment_id', deployment.data.id);
+
+      # PostgreSQL Container App removed - using Azure Database for PostgreSQL instead
+
+      - name: Deploy API Container App
+        run: |
+          # Use Azure Database for PostgreSQL
+          DB_HOST="${POSTGRES_SERVER_PROD}.postgres.database.azure.com"
+          
+          # URL encode the password to handle special characters
+          DB_PASSWORD_ENCODED=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${{ secrets.DB_PASSWORD }}', safe=''))")
+          DATABASE_URL="postgresql://postgres:${DB_PASSWORD_ENCODED}@${DB_HOST}:5432/${DATABASE_NAME}?sslmode=require"
+          
+          echo "Deploying API with image: ${{ needs.promote-images.outputs.api-image }}"
+          
+          # Process YAML configuration with replacements
+          cp configs/container-apps/production/api.yaml api-config.yaml
+          
+          # Replace all placeholders
+          sed -i "s|{{API_IMAGE}}|${{ needs.promote-images.outputs.api-image }}|g" api-config.yaml
+          sed -i "s|{{DATABASE_URL}}|${DATABASE_URL}|g" api-config.yaml
+          sed -i "s|{{AZURE_OPENAI_API_KEY}}|${{ secrets.AZURE_OPENAI_API_KEY }}|g" api-config.yaml
+          sed -i "s|{{AZURE_OPENAI_ENDPOINT}}|${{ secrets.AZURE_OPENAI_ENDPOINT }}|g" api-config.yaml
+          sed -i "s|{{AZURE_OPENAI_DEPLOYMENT}}|${{ secrets.AZURE_OPENAI_DEPLOYMENT }}|g" api-config.yaml
+          sed -i "s|{{AZURE_OPENAI_API_VERSION}}|${{ secrets.AZURE_OPENAI_API_VERSION }}|g" api-config.yaml
+          sed -i "s|{{AZURE_CLIENT_ID}}|${{ secrets.AZURE_CLIENT_ID }}|g" api-config.yaml
+          sed -i "s|{{AZURE_CLIENT_SECRET}}|${{ secrets.AZURE_CLIENT_SECRET }}|g" api-config.yaml
+          sed -i "s|{{AZURE_TENANT_ID}}|${{ secrets.AZURE_TENANT_ID }}|g" api-config.yaml
+          sed -i "s|{{EMAIL_FROM_ADDRESS}}|${{ secrets.EMAIL_FROM_ADDRESS }}|g" api-config.yaml
+          sed -i "s|{{EMAIL_AZURE_CLIENT_ID}}|${{ secrets.EMAIL_AZURE_CLIENT_ID }}|g" api-config.yaml
+          sed -i "s|{{EMAIL_AZURE_CLIENT_SECRET}}|${{ secrets.EMAIL_AZURE_CLIENT_SECRET }}|g" api-config.yaml
+          sed -i "s|{{EMAIL_AZURE_TENANT_ID}}|${{ secrets.EMAIL_AZURE_TENANT_ID }}|g" api-config.yaml
+          sed -i "s|{{DOCS_URL}}|${{ secrets.DOCS_URL }}|g" api-config.yaml
+          
+          # Add registry password secret
+          yq eval '.properties.configuration.secrets += [{"name": "registry-password", "value": "${{ secrets.AZURE_CLIENT_SECRET }}"}]' -i api-config.yaml
+
+          # Deploy or update
+          az containerapp create \
+            --name ${{ env.API_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --environment ${{ env.PROD_ENVIRONMENT }} \
+            --yaml api-config.yaml \
+          || \
+          az containerapp update \
+            --name ${{ env.API_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --yaml api-config.yaml
+          
+          rm api-config.yaml
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${AZURE_REGISTRY}.azurecr.io
+          username: ${{ secrets.AZURE_CLIENT_ID }}
+          password: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+      - name: Build and Deploy Client Container App
+        run: |
+          # Get external API URL for client-side requests
+          API_FQDN=$(az containerapp show \
+            --name ${{ env.API_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+          
+          API_URL="https://${API_FQDN}"
+          echo "Building client with production API URL: ${API_URL}"
+          
+          # Build new client image with production API URL
+          VERSION="${{ needs.validate-deployment.outputs.version }}"
+          PROD_CLIENT_TAG="${VERSION}-prod"
+          
+          docker build \
+            --build-arg NEXT_PUBLIC_API="${API_URL}" \
+            -t ${AZURE_REGISTRY}.azurecr.io/${PROJECT_NAME}/client:${PROD_CLIENT_TAG} \
+            ./services/client
+          
+          docker push ${AZURE_REGISTRY}.azurecr.io/${PROJECT_NAME}/client:${PROD_CLIENT_TAG}
+          
+          echo "Deploying Client with newly built image"
+          
+          # Process YAML configuration
+          cp configs/container-apps/production/client.yaml client-config.yaml
+          
+          # Replace placeholders with newly built image
+          sed -i "s|{{CLIENT_IMAGE}}|${AZURE_REGISTRY}.azurecr.io/${PROJECT_NAME}/client:${PROD_CLIENT_TAG}|g" client-config.yaml
+          sed -i "s|{{API_URL}}|${API_URL}|g" client-config.yaml
+          sed -i "s|{{AZURE_CLIENT_ID}}|${{ secrets.AZURE_CLIENT_ID }}|g" client-config.yaml
+          
+          # Add registry password secret
+          yq eval '.properties.configuration.secrets = [{"name": "registry-password", "value": "${{ secrets.AZURE_CLIENT_SECRET }}"}]' -i client-config.yaml
+
+          # Deploy or update
+          az containerapp create \
+            --name ${{ env.CLIENT_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --environment ${{ env.PROD_ENVIRONMENT }} \
+            --yaml client-config.yaml \
+          || \
+          az containerapp update \
+            --name ${{ env.CLIENT_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --yaml client-config.yaml
+          
+          rm client-config.yaml
+
+      - name: Build and Deploy Admin Container App
+        run: |
+          # Get external API URL for client-side requests
+          API_FQDN=$(az containerapp show \
+            --name ${{ env.API_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+          
+          API_URL="https://${API_FQDN}"
+          echo "Building admin with production API URL: ${API_URL}"
+          
+          # Build new admin image with production API URL
+          VERSION="${{ needs.validate-deployment.outputs.version }}"
+          PROD_ADMIN_TAG="${VERSION}-prod"
+          
+          docker build \
+            --build-arg NEXT_PUBLIC_API="${API_URL}" \
+            -t ${AZURE_REGISTRY}.azurecr.io/${PROJECT_NAME}/admin:${PROD_ADMIN_TAG} \
+            ./services/admin
+          
+          docker push ${AZURE_REGISTRY}.azurecr.io/${PROJECT_NAME}/admin:${PROD_ADMIN_TAG}
+          
+          echo "Deploying Admin with newly built image"
+          
+          # Process YAML configuration
+          cp configs/container-apps/production/admin.yaml admin-config.yaml
+          
+          # Replace placeholders with newly built image
+          sed -i "s|{{ADMIN_IMAGE}}|${AZURE_REGISTRY}.azurecr.io/${PROJECT_NAME}/admin:${PROD_ADMIN_TAG}|g" admin-config.yaml
+          sed -i "s|{{API_URL}}|${API_URL}|g" admin-config.yaml
+          sed -i "s|{{AZURE_CLIENT_ID}}|${{ secrets.AZURE_CLIENT_ID }}|g" admin-config.yaml
+          
+          # Add registry password secret
+          yq eval '.properties.configuration.secrets = [{"name": "registry-password", "value": "${{ secrets.AZURE_CLIENT_SECRET }}"}]' -i admin-config.yaml
+
+          # Deploy or update
+          az containerapp create \
+            --name ${{ env.ADMIN_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --environment ${{ env.PROD_ENVIRONMENT }} \
+            --yaml admin-config.yaml \
+          || \
+          az containerapp update \
+            --name ${{ env.ADMIN_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --yaml admin-config.yaml
+          
+          rm admin-config.yaml
+
+      - name: Get deployment URLs
+        id: get-urls
+        run: |
+          CLIENT_URL=$(az containerapp show \
+            --name ${{ env.CLIENT_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+
+          ADMIN_URL=$(az containerapp show \
+            --name ${{ env.ADMIN_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+
+          API_URL=$(az containerapp show \
+            --name ${{ env.API_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+
+          # Display URLs in logs
+          echo "📌 Production Deployment URLs:"
+          echo "  Client: https://${CLIENT_URL}"
+          echo "  Admin: https://${ADMIN_URL}"
+          echo "  API: https://${API_URL}"
+
+          # Set outputs
+          echo "client-url=https://${CLIENT_URL}" >> $GITHUB_OUTPUT
+          echo "admin-url=https://${ADMIN_URL}" >> $GITHUB_OUTPUT
+          echo "api-url=https://${API_URL}" >> $GITHUB_OUTPUT
+
+      - name: Update deployment status
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const jobStatus = '${{ job.status }}';
+            const deploymentState = jobStatus === 'success' ? 'success' : 'failure';
+
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.create-deployment.outputs.deployment_id }},
+              state: deploymentState,
+              environment_url: '${{ steps.get-urls.outputs.client-url }}',
+              description: `Deployment ${deploymentState}`
+            });
+
+  post-deployment-verification:
+    needs: [validate-deployment, deploy-to-production]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Run smoke tests
+        run: |
+          echo "Running production smoke tests..."
+
+          # Test Client app
+          if curl -f -s "${{ needs.deploy-to-production.outputs.client-url }}" > /dev/null; then
+            echo "Client app is responding"
+          else
+            echo "Client app health check failed"
+            exit 1
+          fi
+
+          # Test Admin app
+          if curl -f -s "${{ needs.deploy-to-production.outputs.admin-url }}" > /dev/null; then
+            echo "Admin app is responding"
+          else
+            echo "Admin app health check failed"
+            exit 1
+          fi
+
+          # We don't have a health check endpoint for the API yet, but we should add one in the future.
+          # # Test API health endpoint
+          # if curl -f -s "${{ needs.deploy-to-production.outputs.api-url }}/health" > /dev/null; then
+          #   echo "API health check passed"
+          # else
+          #   echo "API health check failed"
+          #   exit 1
+          # fi
+
+      - name: Create deployment summary
+        run: |
+          echo "## Production Deployment Complete!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Version ${{ needs.validate-deployment.outputs.version }} Successfully Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Production URLs:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Client: ${{ needs.deploy-to-production.outputs.client-url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Admin: ${{ needs.deploy-to-production.outputs.admin-url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- API: ${{ needs.deploy-to-production.outputs.api-url }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment Details:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Version: \`${{ needs.validate-deployment.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Triggered by: @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Deployment time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Rollback Instructions:**" >> $GITHUB_STEP_SUMMARY
+          echo "If issues are detected, rollback by running the workflow with a previous version tag." >> $GITHUB_STEP_SUMMARY
+
+      - name: Notify deployment complete
+        if: always()
+        run: |
+          # We can get fancy and add a Teams notification here ~
+          echo "Production deployment of ${{ needs.validate-deployment.outputs.version }} completed with status: ${{ job.status }}"

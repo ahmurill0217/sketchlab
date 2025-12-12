@@ -1,0 +1,15 @@
+services:
+  api:
+    container_name: ${PROJECT_NAME}-api
+    build:
+      context: ./services/api/
+    ports:
+      - ${API_PORT:-8000}:8000
+    volumes:
+      - ./services/api/app:/code/app
+    env_file:
+      - services/api/.env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    labels:
+      - "project=${PROJECT_NAME}"

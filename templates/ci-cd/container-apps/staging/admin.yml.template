@@ -1,0 +1,25 @@
+properties:
+  configuration:
+    ingress:
+      external: true
+      targetPort: 3001
+    registries:
+      - server: ${AZURE_REGISTRY}.azurecr.io
+        username: "{{AZURE_CLIENT_ID}}"
+        passwordSecretRef: "registry-password"
+  template:
+    containers:
+      - image: "{{ADMIN_IMAGE}}"
+        name: admin
+        resources:
+          cpu: 0.5
+          memory: 1.0Gi
+        env:
+          - name: NEXT_PUBLIC_API
+            value: "{{API_URL}}"
+          # Add your custom environment variables here:
+          # - name: NEXT_PUBLIC_YOUR_CUSTOM_VAR
+          #   value: "your_value"
+    scale:
+      minReplicas: 1
+      maxReplicas: 3

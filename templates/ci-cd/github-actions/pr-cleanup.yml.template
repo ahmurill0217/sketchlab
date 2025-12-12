@@ -1,0 +1,107 @@
+name: PR Environment Cleanup
+
+on:
+  pull_request:
+    types:
+      - closed
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+env:
+  RESOURCE_GROUP: "${RESOURCE_GROUP}"
+  PR_NUMBER: ${{ github.event.pull_request.number }}
+
+jobs:
+  cleanup-environment:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set resource names
+        id: set-names
+        run: |
+          echo "environment-name=env-${PROJECT_NAME}-pr-${{ env.PR_NUMBER }}" >> $GITHUB_OUTPUT
+          echo "client-app-name=app-${PROJECT_NAME}-client-pr-${{ env.PR_NUMBER }}" >> $GITHUB_OUTPUT
+          echo "admin-app-name=app-${PROJECT_NAME}-admin-pr-${{ env.PR_NUMBER }}" >> $GITHUB_OUTPUT
+          echo "api-app-name=app-${PROJECT_NAME}-api-pr-${{ env.PR_NUMBER }}" >> $GITHUB_OUTPUT
+          # No longer using schema isolation
+
+      - name: Delete Container Apps
+        run: |
+          # Delete all container apps (no PostgreSQL container - using shared database)
+          for app in "${{ steps.set-names.outputs.client-app-name }}" \
+                     "${{ steps.set-names.outputs.admin-app-name }}" \
+                     "${{ steps.set-names.outputs.api-app-name }}"; do
+            echo "Checking if $app exists..."
+            APP_EXISTS=$(az containerapp list \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --query "[?name=='${app}'].name" \
+              -o tsv)
+            
+            if [ ! -z "$APP_EXISTS" ]; then
+              echo "Deleting container app: $app"
+              az containerapp delete \
+                --name "$app" \
+                --resource-group ${{ env.RESOURCE_GROUP }} \
+                --yes
+            else
+              echo "Container app $app not found, skipping..."
+            fi
+          done
+
+      # Note: Using shared database without schema isolation for simplicity
+      # PR environments will share the same database tables
+      # Data will be cleaned/reset periodically or tables can be truncated if needed
+
+      - name: Delete Container App Environment
+        run: |
+          # Check if environment exists
+          ENV_EXISTS=$(az containerapp env list \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "[?name=='${{ steps.set-names.outputs.environment-name }}'].name" \
+            -o tsv)
+          
+          if [ ! -z "$ENV_EXISTS" ]; then
+            echo "Deleting Container App Environment: ${{ steps.set-names.outputs.environment-name }}"
+            az containerapp env delete \
+              --name ${{ steps.set-names.outputs.environment-name }} \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --yes
+          else
+            echo "Environment not found, skipping..."
+          fi
+
+      # Note: We intentionally DO NOT clean up container images here
+      # These images may be promoted to staging/production environments
+      # Consider implementing a separate cleanup policy based on:
+      # - Image age (e.g., delete PR images older than 30 days)
+      # - Registry storage limits
+      # - Whether the image was promoted to production
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `### 🧹 PR Environment Cleaned Up
+              
+              The PR environment \`${{ steps.set-names.outputs.environment-name }}\` and all associated resources have been successfully removed.
+              
+              **Cleaned up resources:**
+              - Container App Environment
+              - Container Apps (client, admin, api)
+              
+              **Note:** Container images and shared dev database remain for reuse by all PRs
+              
+              Thank you for your contribution!`
+            });

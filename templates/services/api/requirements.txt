@@ -1,0 +1,15 @@
+# FastAPI and API Dependencies
+fastapi>=0.109.0
+pydantic>=2.3
+pydantic-settings
+uvicorn[standard]
+
+# Database
+sqlmodel
+psycopg2-binary
+
+# Testing and Development
+pytest
+
+# Environment and Configuration
+python-dotenv 

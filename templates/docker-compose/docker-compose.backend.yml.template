@@ -1,0 +1,42 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: ${PROJECT_NAME}-postgres
+    ports:
+      - ${PG_PORT:-5432}:5432
+    environment:
+      POSTGRES_DB: ${PROJECT_NAME}
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: securepassword
+    healthcheck:
+      test: "pg_isready -h localhost -U postgres -d ${PROJECT_NAME}"
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    labels:
+      - "project=${PROJECT_NAME}"
+
+  api:
+    container_name: ${PROJECT_NAME}-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    build:
+      context: ./services/api/
+    ports:
+      - ${API_PORT:-8000}:8000
+    volumes:
+      - ./services/api/app:/code/app
+    env_file:
+      - services/api/.env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    labels:
+      - "project=${PROJECT_NAME}"
+
+volumes:
+  db-data:
+    labels:
+      - "project=${PROJECT_NAME}"

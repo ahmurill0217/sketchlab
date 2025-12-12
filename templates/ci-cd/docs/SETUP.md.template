@@ -1,0 +1,260 @@
+# ${PROJECT_NAME} - CI/CD Setup Guide
+
+This guide contains the Azure CLI commands and GitHub configuration needed to deploy your application.
+
+## Prerequisites
+
+- Azure subscription with necessary permissions
+- GitHub repository 
+- Azure CLI installed and authenticated
+- CI/CD files generated (✅ already done!)
+
+## Step 1: Create Azure Resources
+
+### Resource Overview
+
+#### 📋 Resources to Create (project-specific)
+- Container Apps Environments (staging & production)
+- PostgreSQL Flexible Servers (staging & production only)
+- Database schema in shared dev server
+- Log Analytics Workspace
+- Service Principal for GitHub Actions
+
+#### ✅ Shared Infrastructure (already exists)
+- **Resource Group**: `${RESOURCE_GROUP}`
+- **Container Registry**: `${AZURE_REGISTRY}.azurecr.io`
+- **Dev Database Server**: `${POSTGRES_SERVER_DEV}`
+
+⚠️ **Note**: You'll need Contributor permissions in the `${RESOURCE_GROUP}` resource group.
+
+### Azure CLI Commands
+
+Copy and run these commands in order:
+
+#### 1. Create Log Analytics Workspace
+
+```bash
+az monitor log-analytics workspace create \
+  --workspace-name log-${PROJECT_NAME} \
+  --resource-group ${RESOURCE_GROUP} \
+  --location ${AZURE_LOCATION}
+```
+
+#### 2. Create Container Apps Environments
+
+```bash
+# Get workspace credentials (run after creating workspace above)
+WORKSPACE_ID=$(az monitor log-analytics workspace show \
+  --name log-${PROJECT_NAME} \
+  --resource-group ${RESOURCE_GROUP} \
+  --query customerId -o tsv)
+
+WORKSPACE_KEY=$(az monitor log-analytics workspace get-shared-keys \
+  --name log-${PROJECT_NAME} \
+  --resource-group ${RESOURCE_GROUP} \
+  --query primarySharedKey -o tsv)
+
+# Create staging environment
+az containerapp env create \
+  --name env-${PROJECT_NAME}-stg \
+  --resource-group ${RESOURCE_GROUP} \
+  --location ${AZURE_LOCATION} \
+  --logs-workspace-id $WORKSPACE_ID \
+  --logs-workspace-key $WORKSPACE_KEY
+
+# Create production environment  
+az containerapp env create \
+  --name env-${PROJECT_NAME}-prod \
+  --resource-group ${RESOURCE_GROUP} \
+  --location ${AZURE_LOCATION} \
+  --logs-workspace-id $WORKSPACE_ID \
+  --logs-workspace-key $WORKSPACE_KEY
+```
+
+#### 3. Create PostgreSQL Flexible Servers
+
+```bash
+# Staging database server
+az postgres flexible-server create \
+  --name ${POSTGRES_SERVER_STAGING} \
+  --resource-group ${RESOURCE_GROUP} \
+  --location ${AZURE_LOCATION} \
+  --admin-user postgres \
+  --admin-password '<YOUR_DB_PASSWORD>' \
+  --sku-name Standard_B1ms \
+  --storage-size 32 \
+  --version 15
+
+# Production database server
+az postgres flexible-server create \
+  --name ${POSTGRES_SERVER_PROD} \
+  --resource-group ${RESOURCE_GROUP} \
+  --location ${AZURE_LOCATION} \
+  --admin-user postgres \
+  --admin-password '<YOUR_DB_PASSWORD>' \
+  --sku-name Standard_B2s \
+  --storage-size 128 \
+  --version 15
+```
+
+#### 4. Configure Database Firewall
+
+```bash
+# Allow Azure services - Staging
+az postgres flexible-server firewall-rule create \
+  --resource-group ${RESOURCE_GROUP} \
+  --name ${POSTGRES_SERVER_STAGING} \
+  --rule-name AllowAzureServices \
+  --start-ip-address 0.0.0.0 \
+  --end-ip-address 0.0.0.0
+
+# Allow Azure services - Production  
+az postgres flexible-server firewall-rule create \
+  --resource-group ${RESOURCE_GROUP} \
+  --name ${POSTGRES_SERVER_PROD} \
+  --rule-name AllowAzureServices \
+  --start-ip-address 0.0.0.0 \
+  --end-ip-address 0.0.0.0
+```
+
+#### 5. Create Databases
+
+```bash
+# Staging database
+az postgres flexible-server db create \
+  --server-name ${POSTGRES_SERVER_STAGING} \
+  --resource-group ${RESOURCE_GROUP} \
+  --database-name ${DATABASE_NAME}
+
+# Production database
+az postgres flexible-server db create \
+  --server-name ${POSTGRES_SERVER_PROD} \
+  --resource-group ${RESOURCE_GROUP} \
+  --database-name ${DATABASE_NAME}
+
+# Development schema in shared database
+# Note: Requires the shared dev database password from your Azure administrator
+psql \
+  -h ${POSTGRES_SERVER_DEV}.postgres.database.azure.com \
+  -U postgres \
+  -d devdb \
+  -c "CREATE SCHEMA IF NOT EXISTS ${DATABASE_NAME};"
+```
+
+#### 6. Create Service Principal for GitHub Actions
+
+```bash
+az ad sp create-for-rbac \
+  --display-name sp-${PROJECT_NAME}-github \
+  --role Contributor \
+  --scopes /subscriptions/$(az account show --query id -o tsv)/resourceGroups/${RESOURCE_GROUP}
+```
+
+**⚠️ IMPORTANT**: Save the JSON output from this command. You'll need it for GitHub secrets.
+
+## Step 2: Configure GitHub Secrets
+
+Add the following secrets to your GitHub repository (`Settings > Secrets and variables > Actions`):
+
+### Required Secrets
+
+| Secret Name | Description | Source |
+|-------------|-------------|---------|
+| `AZURE_CREDENTIALS` | Service principal JSON | Output from `az ad sp create-for-rbac` command |
+| `AZURE_CLIENT_ID` | Service principal client ID | From service principal JSON |
+| `AZURE_CLIENT_SECRET` | Service principal client secret | From service principal JSON |
+| `AZURE_TENANT_ID` | Azure tenant ID | From service principal JSON |
+| `DB_PASSWORD` | PostgreSQL password | From database creation |
+| `LOG_ANALYTICS_WORKSPACE_ID` | Workspace ID | From `az monitor log-analytics workspace show` |
+| `LOG_ANALYTICS_WORKSPACE_KEY` | Workspace key | From `az monitor log-analytics workspace get-shared-keys` |
+
+### Application-Specific Secrets (Optional)
+
+Add any secrets your application requires. Examples:
+- API keys (e.g., `OPENAI_API_KEY`, `SENDGRID_API_KEY`)
+- External service URLs (e.g., `DOCS_URL`, `CRM_ENDPOINT`)
+- Third-party credentials
+
+Remember to also add these to your container app environment variables in the workflow files.
+
+## Step 3: Test the Setup
+
+1. **Create a feature branch and PR**:
+   ```bash
+   git checkout staging
+   git checkout -b feature/test-deployment
+   git push origin feature/test-deployment
+   # Create PR to staging branch via GitHub UI
+   ```
+
+2. **Check PR deployment**:
+   - PR environment should be created automatically
+   - Look for deployment comment on the PR
+
+3. **Test staging deployment**:
+   ```bash
+   # Option 1: Merge the PR to staging via GitHub UI
+   # Option 2: Push directly to staging
+   git checkout staging
+   git push origin staging
+   ```
+
+4. **Test production deployment**:
+   ```bash
+   git tag v1.0.0
+   git push origin v1.0.0
+   ```
+
+## Step 4: Customize Workflows (Optional)
+
+Generated workflows are located in `.github/workflows/`:
+- `dev-deploy.yml` - PR environments
+- `staging-deploy.yml` - Staging deployment
+- `prod-deploy.yml` - Production deployment  
+- `pr-cleanup.yml` - PR environment cleanup
+
+Container Apps configurations are in `configs/container-apps/`:
+- `staging/` - Staging environment configs
+- `production/` - Production environment configs
+
+## Validation Checklist
+
+- [ ] Azure resources created successfully
+- [ ] GitHub secrets configured
+- [ ] PR deployment works
+- [ ] Staging deployment works  
+- [ ] Production deployment works
+- [ ] Application URLs are accessible
+- [ ] Database connections work
+- [ ] Logs are visible in Azure
+
+## Troubleshooting
+
+### Common Setup Issues
+
+1. **Permission Denied Errors**
+   - Verify Azure CLI is authenticated: `az account show`
+   - Check service principal has Contributor role
+   - Ensure you have permissions to create resources
+
+2. **GitHub Actions Failures**
+   - Double-check all secrets are configured correctly
+   - Verify secret names match exactly (case-sensitive)
+   - Check Azure resource names match configuration
+
+3. **Container App Deployment Issues**
+   - Verify container registry credentials
+   - Check Docker builds work locally: `docker build .`
+   - Ensure all required environment variables are set
+
+4. **Database Connection Problems**
+   - Verify database server exists and is running
+   - Check firewall rules allow Azure services
+   - Confirm connection strings are correct
+
+### Getting Help
+
+- View Azure resources: `az resource list --resource-group ${RESOURCE_GROUP}`
+- Check GitHub Actions logs for detailed error messages
+- Test service detection: `make services`
+- Review Azure Container Apps logs in Azure portal

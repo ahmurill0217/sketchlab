@@ -1,0 +1,534 @@
+name: Deploy to Staging
+
+on:
+  push:
+    branches:
+      - staging
+    paths:
+      - "services/**"
+      - ".github/workflows/**"
+      - "configs/container-apps/**"
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to deploy (optional - defaults to latest merged PR)"
+        required: false
+        type: string
+
+concurrency:
+  group: staging-deployment
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+env:
+  IMAGE_REGISTRY: "${AZURE_REGISTRY}.azurecr.io/${PROJECT_NAME}"
+  RESOURCE_GROUP: "rg-${PROJECT_NAME}"
+  STAGING_ENVIRONMENT: "env-${PROJECT_NAME}-staging"
+  CLIENT_APP_NAME: "app-${PROJECT_NAME}-client-stg"
+  ADMIN_APP_NAME: "app-${PROJECT_NAME}-admin-stg"
+  API_APP_NAME: "app-${PROJECT_NAME}-api-stg"
+  POSTGRES_APP_NAME: "app-${PROJECT_NAME}-db-stg"
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  get-pr-images:
+    runs-on: ubuntu-22.04
+    outputs:
+      client-image: ${{ steps.get-images.outputs.client-image }}
+      admin-image: ${{ steps.get-images.outputs.admin-image }}
+      api-image: ${{ steps.get-images.outputs.api-image }}
+      client-tag: ${{ steps.get-images.outputs.client-tag }}
+      admin-tag: ${{ steps.get-images.outputs.admin-tag }}
+      api-tag: ${{ steps.get-images.outputs.api-tag }}
+      pr-number: ${{ steps.get-images.outputs.pr-number }}
+      has-pr-images: ${{ steps.get-images.outputs.has-pr-images }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR information
+        id: get-images
+        run: |
+          # If PR number provided via workflow_dispatch, use it
+          if [ -n "${{ inputs.pr_number }}" ]; then
+            PR_NUMBER="${{ inputs.pr_number }}"
+            echo "Using manually specified PR #${PR_NUMBER}"
+          else
+            # Get the most recently merged PR
+            PR_NUMBER=$(gh pr list \
+              --base staging \
+              --state merged \
+              --limit 1 \
+              --json number,mergeCommit \
+              --jq '.[0].number')
+
+            if [ -z "$PR_NUMBER" ]; then
+              echo "No merged PRs found - will build from source"
+              echo "has-pr-images=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "Using most recently merged PR #${PR_NUMBER}"
+          fi
+
+          # Azure Login for registry access
+          az login --service-principal \
+            -u ${{ secrets.AZURE_CLIENT_ID }} \
+            -p ${{ secrets.AZURE_CLIENT_SECRET }} \
+            --tenant ${{ secrets.AZURE_TENANT_ID }}
+
+          # Find the latest image tag for this PR
+          echo "Searching for latest images with pattern pr-${PR_NUMBER}-*"
+
+          # Get latest tag for each service
+          for repo in client admin api; do
+            # Get all tags for this PR, sorted by timestamp (newest first)
+            LATEST_TAG=$(az acr repository show-tags \
+              --name ${AZURE_REGISTRY} \
+              --repository "${PROJECT_NAME}/${repo}" \
+              --orderby time_desc \
+              --query "[?starts_with(@, 'pr-${PR_NUMBER}-')] | [0]" \
+              --output tsv)
+
+            if [ -z "$LATEST_TAG" ]; then
+              echo "❌ No images found for ${repo} with pattern pr-${PR_NUMBER}-*"
+              echo "has-pr-images=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            echo "Found latest ${repo} tag: ${LATEST_TAG}"
+
+            # Set outputs
+            case ${repo} in
+              client)
+                echo "client-image=${{ env.IMAGE_REGISTRY }}/${repo}:${LATEST_TAG}" >> $GITHUB_OUTPUT
+                echo "client-tag=${LATEST_TAG}" >> $GITHUB_OUTPUT
+                ;;
+              admin)
+                echo "admin-image=${{ env.IMAGE_REGISTRY }}/${repo}:${LATEST_TAG}" >> $GITHUB_OUTPUT
+                echo "admin-tag=${LATEST_TAG}" >> $GITHUB_OUTPUT
+                ;;
+              api)
+                echo "api-image=${{ env.IMAGE_REGISTRY }}/${repo}:${LATEST_TAG}" >> $GITHUB_OUTPUT
+                echo "api-tag=${LATEST_TAG}" >> $GITHUB_OUTPUT
+                ;;
+            esac
+          done
+
+          echo "pr-number=${PR_NUMBER}" >> $GITHUB_OUTPUT
+          echo "has-pr-images=true" >> $GITHUB_OUTPUT
+          echo "✅ Successfully identified all images for PR #${PR_NUMBER}"
+
+      - name: Display deployment images
+        if: steps.get-images.outputs.has-pr-images == 'true'
+        run: |
+          echo "📦 Deployment images verified and ready:"
+          echo "  Client: ${{ steps.get-images.outputs.client-image }}"
+          echo "  Admin: ${{ steps.get-images.outputs.admin-image }}"
+          echo "  API: ${{ steps.get-images.outputs.api-image }}"
+
+  generate-tags:
+    needs: get-pr-images
+    if: needs.get-pr-images.outputs.has-pr-images != 'true'
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.generate.outputs.tag }}
+      client-image: ${{ steps.generate.outputs.client-image }}
+      admin-image: ${{ steps.generate.outputs.admin-image }}
+      api-image: ${{ steps.generate.outputs.api-image }}
+      client-tag: ${{ steps.generate.outputs.client-tag }}
+      admin-tag: ${{ steps.generate.outputs.admin-tag }}
+      api-tag: ${{ steps.generate.outputs.api-tag }}
+    steps:
+      - name: Generate image tags
+        id: generate
+        run: |
+          SHORT_SHA=${GITHUB_SHA:0:7}
+          TAG="staging-${SHORT_SHA}"
+          
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "client-image=${{ env.IMAGE_REGISTRY }}/client:${TAG}" >> $GITHUB_OUTPUT
+          echo "admin-image=${{ env.IMAGE_REGISTRY }}/admin:${TAG}" >> $GITHUB_OUTPUT
+          echo "api-image=${{ env.IMAGE_REGISTRY }}/api:${TAG}" >> $GITHUB_OUTPUT
+          echo "client-tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "admin-tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "api-tag=${TAG}" >> $GITHUB_OUTPUT
+          
+          echo "Generated tag: ${TAG}"
+
+  build-images:
+    needs: [get-pr-images, generate-tags]
+    if: needs.get-pr-images.outputs.has-pr-images != 'true'
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        include:
+          - service: client
+            context: ./services/client
+            image: ${{ needs.generate-tags.outputs.client-image }}
+          - service: admin
+            context: ./services/admin
+            image: ${{ needs.generate-tags.outputs.admin-image }}
+          - service: api
+            context: ./services/api
+            image: ${{ needs.generate-tags.outputs.api-image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${AZURE_REGISTRY}.azurecr.io
+          username: ${{ secrets.AZURE_CLIENT_ID }}
+          password: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+      - name: Build and push ${{ matrix.service }} image
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.context }}
+          push: true
+          tags: ${{ matrix.image }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  deploy-to-staging:
+    needs: [get-pr-images, generate-tags, build-images]
+    if: always() && !cancelled() && !failure()
+    runs-on: ubuntu-22.04
+    environment: staging
+    outputs:
+      client-url: ${{ steps.get-urls.outputs.client-url }}
+      admin-url: ${{ steps.get-urls.outputs.admin-url }}
+      api-url: ${{ steps.get-urls.outputs.api-url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # PostgreSQL Container App removed - using Azure Database for PostgreSQL instead
+
+      - name: Deploy API Container App
+        run: |
+          # Use Azure Database for PostgreSQL
+          DB_HOST="${POSTGRES_SERVER_STAGING}.postgres.database.azure.com"
+          
+          # URL encode the password to handle special characters
+          DB_PASSWORD_ENCODED=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${{ secrets.DB_PASSWORD }}', safe=''))")
+          DATABASE_URL="postgresql://postgres:${DB_PASSWORD_ENCODED}@${DB_HOST}:5432/${DATABASE_NAME}?sslmode=require"
+          
+          # Determine which image to use
+          if [ "${{ needs.get-pr-images.outputs.has-pr-images }}" == "true" ]; then
+            API_IMAGE="${{ needs.get-pr-images.outputs.api-image }}"
+          else
+            API_IMAGE="${{ needs.generate-tags.outputs.api-image }}"
+          fi
+          
+          # Process YAML configuration with replacements
+          cp configs/container-apps/staging/api.yaml api-config.yaml
+          
+          # Replace all placeholders
+          sed -i "s|{{API_IMAGE}}|${API_IMAGE}|g" api-config.yaml
+          sed -i "s|{{DATABASE_URL}}|${DATABASE_URL}|g" api-config.yaml
+          sed -i "s|{{AZURE_OPENAI_API_KEY}}|${{ secrets.AZURE_OPENAI_API_KEY }}|g" api-config.yaml
+          sed -i "s|{{AZURE_OPENAI_ENDPOINT}}|${{ secrets.AZURE_OPENAI_ENDPOINT }}|g" api-config.yaml
+          sed -i "s|{{AZURE_OPENAI_DEPLOYMENT}}|${{ secrets.AZURE_OPENAI_DEPLOYMENT }}|g" api-config.yaml
+          sed -i "s|{{AZURE_OPENAI_API_VERSION}}|${{ secrets.AZURE_OPENAI_API_VERSION }}|g" api-config.yaml
+          sed -i "s|{{DOCS_URL}}|${{ secrets.DOCS_URL }}|g" api-config.yaml
+          sed -i "s|{{AZURE_CLIENT_ID}}|${{ secrets.AZURE_CLIENT_ID }}|g" api-config.yaml
+          sed -i "s|{{AZURE_CLIENT_SECRET}}|${{ secrets.AZURE_CLIENT_SECRET }}|g" api-config.yaml
+          sed -i "s|{{AZURE_TENANT_ID}}|${{ secrets.AZURE_TENANT_ID }}|g" api-config.yaml
+          sed -i "s|{{EMAIL_FROM_ADDRESS}}|${{ secrets.EMAIL_FROM_ADDRESS }}|g" api-config.yaml
+          sed -i "s|{{EMAIL_AZURE_CLIENT_ID}}|${{ secrets.EMAIL_AZURE_CLIENT_ID }}|g" api-config.yaml
+          sed -i "s|{{EMAIL_AZURE_CLIENT_SECRET}}|${{ secrets.EMAIL_AZURE_CLIENT_SECRET }}|g" api-config.yaml
+          sed -i "s|{{EMAIL_AZURE_TENANT_ID}}|${{ secrets.EMAIL_AZURE_TENANT_ID }}|g" api-config.yaml
+          
+          # Add registry password secret
+          yq eval '.properties.configuration.secrets += [{"name": "registry-password", "value": "${{ secrets.AZURE_CLIENT_SECRET }}"}]' -i api-config.yaml
+
+          # Deploy or update
+          az containerapp create \
+            --name ${{ env.API_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --environment ${{ env.STAGING_ENVIRONMENT }} \
+            --yaml api-config.yaml \
+          || \
+          az containerapp update \
+            --name ${{ env.API_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --yaml api-config.yaml
+          
+          rm api-config.yaml
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${AZURE_REGISTRY}.azurecr.io
+          username: ${{ secrets.AZURE_CLIENT_ID }}
+          password: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+      - name: Build and Deploy Client Container App
+        run: |
+          # Get external API URL for client-side requests
+          API_FQDN=$(az containerapp show \
+            --name ${{ env.API_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+          
+          API_URL="https://${API_FQDN}"
+          echo "Building client with API URL: ${API_URL}"
+          
+          # Determine which tag to use
+          if [ "${{ needs.get-pr-images.outputs.has-pr-images }}" == "true" ]; then
+            STAGING_CLIENT_TAG="${{ needs.get-pr-images.outputs.client-tag }}-with-api"
+          else
+            STAGING_CLIENT_TAG="${{ needs.generate-tags.outputs.client-tag }}-with-api"
+          fi
+          
+          docker build \
+            --build-arg NEXT_PUBLIC_API="${API_URL}" \
+            -t ${AZURE_REGISTRY}.azurecr.io/${PROJECT_NAME}/client:${STAGING_CLIENT_TAG} \
+            ./services/client
+          
+          docker push ${AZURE_REGISTRY}.azurecr.io/${PROJECT_NAME}/client:${STAGING_CLIENT_TAG}
+          
+          # Process YAML configuration with new image
+          cp configs/container-apps/staging/client.yaml client-config.yaml
+          
+          # Replace placeholders with new image tag
+          sed -i "s|{{CLIENT_IMAGE}}|${AZURE_REGISTRY}.azurecr.io/${PROJECT_NAME}/client:${STAGING_CLIENT_TAG}|g" client-config.yaml
+          sed -i "s|{{API_URL}}|${API_URL}|g" client-config.yaml
+          sed -i "s|{{AZURE_CLIENT_ID}}|${{ secrets.AZURE_CLIENT_ID }}|g" client-config.yaml
+          
+          # Add registry password secret
+          yq eval '.properties.configuration.secrets = [{"name": "registry-password", "value": "${{ secrets.AZURE_CLIENT_SECRET }}"}]' -i client-config.yaml
+
+          # Deploy or update
+          az containerapp create \
+            --name ${{ env.CLIENT_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --environment ${{ env.STAGING_ENVIRONMENT }} \
+            --yaml client-config.yaml \
+          || \
+          az containerapp update \
+            --name ${{ env.CLIENT_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --yaml client-config.yaml
+          
+          rm client-config.yaml
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Build and Deploy Admin Container App
+        run: |
+          # Get external API URL for client-side requests
+          API_FQDN=$(az containerapp show \
+            --name ${{ env.API_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+          
+          API_URL="https://${API_FQDN}"
+          echo "Building admin with API URL: ${API_URL}"
+          
+          # Determine which tag to use
+          if [ "${{ needs.get-pr-images.outputs.has-pr-images }}" == "true" ]; then
+            STAGING_ADMIN_TAG="${{ needs.get-pr-images.outputs.admin-tag }}-with-api"
+          else
+            STAGING_ADMIN_TAG="${{ needs.generate-tags.outputs.admin-tag }}-with-api"
+          fi
+          
+          docker build \
+            --build-arg NEXT_PUBLIC_API="${API_URL}" \
+            -t ${AZURE_REGISTRY}.azurecr.io/${PROJECT_NAME}/admin:${STAGING_ADMIN_TAG} \
+            ./services/admin
+          
+          docker push ${AZURE_REGISTRY}.azurecr.io/${PROJECT_NAME}/admin:${STAGING_ADMIN_TAG}
+          
+          # Process YAML configuration with new image
+          cp configs/container-apps/staging/admin.yaml admin-config.yaml
+          
+          # Replace placeholders with new image tag
+          sed -i "s|{{ADMIN_IMAGE}}|${AZURE_REGISTRY}.azurecr.io/${PROJECT_NAME}/admin:${STAGING_ADMIN_TAG}|g" admin-config.yaml
+          sed -i "s|{{API_URL}}|${API_URL}|g" admin-config.yaml
+          sed -i "s|{{AZURE_CLIENT_ID}}|${{ secrets.AZURE_CLIENT_ID }}|g" admin-config.yaml
+          
+          # Add registry password secret
+          yq eval '.properties.configuration.secrets = [{"name": "registry-password", "value": "${{ secrets.AZURE_CLIENT_SECRET }}"}]' -i admin-config.yaml
+
+          # Deploy or update
+          az containerapp create \
+            --name ${{ env.ADMIN_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --environment ${{ env.STAGING_ENVIRONMENT }} \
+            --yaml admin-config.yaml \
+          || \
+          az containerapp update \
+            --name ${{ env.ADMIN_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --yaml admin-config.yaml
+          
+          rm admin-config.yaml
+
+      - name: Get deployment URLs
+        id: get-urls
+        run: |
+          CLIENT_URL=$(az containerapp show \
+            --name ${{ env.CLIENT_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+
+          ADMIN_URL=$(az containerapp show \
+            --name ${{ env.ADMIN_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+
+          API_URL=$(az containerapp show \
+            --name ${{ env.API_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+
+          # Display URLs in logs
+          echo "📌 Deployment URLs:"
+          echo "  Client: https://${CLIENT_URL}"
+          echo "  Admin: https://${ADMIN_URL}"
+          echo "  API: https://${API_URL}"
+
+          # Set outputs
+          echo "client-url=https://${CLIENT_URL}" >> $GITHUB_OUTPUT
+          echo "admin-url=https://${ADMIN_URL}" >> $GITHUB_OUTPUT
+          echo "api-url=https://${API_URL}" >> $GITHUB_OUTPUT
+
+  tag-as-staging:
+    needs: [get-pr-images, generate-tags, deploy-to-staging]
+    if: always() && !cancelled() && !failure()
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Tag images as staging
+        run: |
+          # Tag the deployed images as staging-latest for easy reference
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          
+          # Determine which tags to use
+          if [ "${{ needs.get-pr-images.outputs.has-pr-images }}" == "true" ]; then
+            CLIENT_TAG="${{ needs.get-pr-images.outputs.client-tag }}"
+            ADMIN_TAG="${{ needs.get-pr-images.outputs.admin-tag }}"
+            API_TAG="${{ needs.get-pr-images.outputs.api-tag }}"
+          else
+            CLIENT_TAG="${{ needs.generate-tags.outputs.client-tag }}"
+            ADMIN_TAG="${{ needs.generate-tags.outputs.admin-tag }}"
+            API_TAG="${{ needs.generate-tags.outputs.api-tag }}"
+          fi
+
+          # Client image
+          echo "Tagging client image..."
+          az acr import \
+            --name ${AZURE_REGISTRY} \
+            --source "${AZURE_REGISTRY}.azurecr.io/${PROJECT_NAME}/client:${CLIENT_TAG}" \
+            --image "${PROJECT_NAME}/client:staging-latest" \
+            --force
+
+          az acr import \
+            --name ${AZURE_REGISTRY} \
+            --source "${AZURE_REGISTRY}.azurecr.io/${PROJECT_NAME}/client:${CLIENT_TAG}" \
+            --image "${PROJECT_NAME}/client:staging-${TIMESTAMP}" \
+            --force
+
+          # Admin image
+          echo "Tagging admin image..."
+          az acr import \
+            --name ${AZURE_REGISTRY} \
+            --source "${AZURE_REGISTRY}.azurecr.io/${PROJECT_NAME}/admin:${ADMIN_TAG}" \
+            --image "${PROJECT_NAME}/admin:staging-latest" \
+            --force
+
+          az acr import \
+            --name ${AZURE_REGISTRY} \
+            --source "${AZURE_REGISTRY}.azurecr.io/${PROJECT_NAME}/admin:${ADMIN_TAG}" \
+            --image "${PROJECT_NAME}/admin:staging-${TIMESTAMP}" \
+            --force
+
+          # API image
+          echo "Tagging api image..."
+          az acr import \
+            --name ${AZURE_REGISTRY} \
+            --source "${AZURE_REGISTRY}.azurecr.io/${PROJECT_NAME}/api:${API_TAG}" \
+            --image "${PROJECT_NAME}/api:staging-latest" \
+            --force
+
+          az acr import \
+            --name ${AZURE_REGISTRY} \
+            --source "${AZURE_REGISTRY}.azurecr.io/${PROJECT_NAME}/api:${API_TAG}" \
+            --image "${PROJECT_NAME}/api:staging-${TIMESTAMP}" \
+            --force
+
+          echo "✅ Successfully tagged all images as staging-latest and staging-${TIMESTAMP}"
+
+  deployment-summary:
+    needs: [get-pr-images, generate-tags, deploy-to-staging]
+    if: always() && !cancelled() && !failure()
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create deployment summary
+        run: |
+          echo "## Staging Deployment Complete!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Latest Changes Deployed to Staging" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment Details:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Commit: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Triggered by: @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Deploy time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**URLs:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Client: ${{ needs.deploy-to-staging.outputs.client-url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Admin: ${{ needs.deploy-to-staging.outputs.admin-url }}" >> $GITHUB_STEP_SUMMARY
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Images deployed:**" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ needs.get-pr-images.outputs.has-pr-images }}" == "true" ]; then
+            echo "- \`${{ needs.get-pr-images.outputs.client-image }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- \`${{ needs.get-pr-images.outputs.admin-image }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- \`${{ needs.get-pr-images.outputs.api-image }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "_Images promoted from PR #${{ needs.get-pr-images.outputs.pr-number }}_" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- \`${{ needs.generate-tags.outputs.client-image }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- \`${{ needs.generate-tags.outputs.admin-image }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- \`${{ needs.generate-tags.outputs.api-image }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "_Images built from source (direct push to staging)_" >> $GITHUB_STEP_SUMMARY
+          fi

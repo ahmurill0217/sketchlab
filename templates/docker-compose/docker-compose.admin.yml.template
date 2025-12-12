@@ -1,0 +1,17 @@
+services:
+  admin:
+    container_name: ${PROJECT_NAME}-admin
+    build:
+      context: ./services/admin/
+      target: local
+    ports:
+      - ${ADMIN_PORT:-3001}:3001
+    volumes:
+      - ./services/admin/:/usr/src/app
+      - /usr/src/app/node_modules
+    environment:
+      - NEXT_TELEMETRY_DISABLED=1
+    env_file:
+      - services/admin/.env
+    labels:
+      - "project=${PROJECT_NAME}"
