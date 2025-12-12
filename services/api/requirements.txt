@@ -3,13 +3,32 @@ fastapi>=0.109.0
 pydantic>=2.3
 pydantic-settings
 uvicorn[standard]
+python-multipart
 
 # Database
 sqlmodel
 psycopg2-binary
 
+# Image Processing
+pillow>=10.0.0
+numpy>=1.24.0
+
+# ControlNet Preprocessors
+controlnet_aux>=0.0.7
+
+# Stable Diffusion (Phase 2)
+diffusers>=0.25.0
+accelerate>=0.25.0
+
+# ML Dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.30.0
+huggingface_hub>=0.20.0
+safetensors>=0.4.0
+
 # Testing and Development
 pytest
 
 # Environment and Configuration
-python-dotenv 
+python-dotenv
